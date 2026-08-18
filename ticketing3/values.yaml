@@ -1,0 +1,222 @@
+nginx:
+  image:
+    name: registry.asap.dsna.fr/dsna/cloud/guic-dev-helm/nginx-unprivileged:latest
+    pullPolicy: IfNotPresent
+    imagePullSecrets: 4pullguic
+
+  port: 8080
+
+  resources: {}
+
+  config: |
+    server {
+        listen 8080;
+        server_name localhost;
+
+        root /var/www/html/public;
+        index index.php;
+
+
+        # =========================
+        # GLPI principal
+        # =========================
+
+        location / {
+
+            try_files $uri $uri/ /index.php$is_args$args;
+        }
+
+
+        # =========================
+        # Front controller GLPI 11
+        # =========================
+
+        location ~ ^/index\.php(/|$) {
+
+            include fastcgi_params;
+
+            fastcgi_pass php.guic-dev.svc.cluster.local:9000;
+
+            fastcgi_split_path_info ^(.+\.php)(/.+)$;
+
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param DOCUMENT_ROOT $document_root;
+            fastcgi_param PATH_INFO $fastcgi_path_info;
+            fastcgi_param QUERY_STRING $query_string;
+        }
+
+
+        # =========================
+        # API REST GLPI
+        # =========================
+
+        location ~ ^/apirest\.php(/|$) {
+
+            include fastcgi_params;
+
+            fastcgi_pass php.guic-dev.svc.cluster.local:9000;
+
+            fastcgi_split_path_info ^(.+\.php)(/.+)$;
+
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param DOCUMENT_ROOT $document_root;
+            fastcgi_param PATH_INFO $fastcgi_path_info;
+            fastcgi_param QUERY_STRING $query_string;
+        }
+
+
+        # =========================
+        # Plugins GLPI
+        # =========================
+        # NOTE: pas de location dediee ici. Les fichiers des
+        # plugins (front/*.php, public/*.php, etc.) vivent en
+        # dehors de public/ (comme install/ et front/ du coeur
+        # GLPI), donc les cibler directement via SCRIPT_FILENAME
+        # = $document_root$fastcgi_script_name echoue (fichier
+        # introuvable). On laisse la location / (try_files) les
+        # faire retomber naturellement sur index.php, qui route
+        # tout en interne, y compris /plugins/*.
+        # =========================
+
+
+        # =========================
+        # Ressources statiques
+        # =========================
+
+        location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+
+            expires 7d;
+
+            access_log off;
+        }
+
+
+        # =========================
+        # NOTE: pas de blocage generique des .php ici.
+        # GLPI 11 route TOUT via public/index.php : toute URL
+        # .php qui ne correspond a aucun fichier reel dans
+        # public/ (front/login.php, install/install.php,
+        # plugins/*/front/*.php, etc.) retombe naturellement
+        # sur index.php via le try_files de la location / ci-
+        # dessus. C'est le comportement officiellement
+        # recommande par GLPI (cf. doc install).
+        # =========================
+
+
+        # =========================
+        # Protection fichiers cachés
+        # =========================
+
+        location ~ /\. {
+
+            deny all;
+        }
+
+
+        # =========================
+        # Protection fichiers internes GLPI
+        # =========================
+
+        location ~ ^/(config|files|vendor|src|templates|bin)/ {
+
+            deny all;
+        }
+    }
+
+
+
+# =========================
+# PHP-FPM
+# =========================
+
+php:
+  image: eftechcombr/glpi:php-fpm-11.0.8
+
+  port: 9000
+
+  resources: {}
+
+
+
+# =========================
+# STOCKAGE GLPI
+# =========================
+
+pvc:
+  name: shared-storage
+
+  storageClassName: nfs-csi
+
+  accessModes:
+    - ReadWriteOnce
+
+  size: 1Gi
+
+
+
+# =========================
+# DATABASE MARIADB
+# =========================
+
+database:
+  type: mariadb
+
+  image: mariadb
+
+  tag: "10.6"
+
+  pullPolicy: IfNotPresent
+
+  rootPassword: root_password
+
+  glpiUser: glpi_user
+
+  glpiPassword: glpi_password
+
+  glpiDatabase: glpi_db
+
+
+
+# =========================
+# PERSISTANCE DATABASE
+# =========================
+
+persistence:
+  database:
+    enabled: true
+
+    size: 5Gi
+
+    accessMode: ReadWriteOnce
+
+
+
+# =========================
+# SERVICES
+# =========================
+
+service:
+  nginxPort: 8080
+
+  phpPort: 9000
+
+  databasePort: 3306
+
+
+
+# =========================
+# OPENSHIFT ROUTE
+# =========================
+
+route:
+  enabled: true
+
+  host: ticketing-guic-dev.apps.ext-preops.dsna.cloud
+
+
+
+# =========================
+# RESSOURCES
+# =========================
+
+resources: {}

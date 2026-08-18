@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: php
+  template:
+    metadata:
+      labels:
+        app: php
+    spec:
+      containers:
+        - name: php-fpm
+          image: {{ .Values.php.image }}
+          ports:
+            - containerPort: {{ .Values.php.port }}
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /var/www/html
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.pvc.name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php
+spec:
+  selector:
+    app: php
+  ports:
+    - protocol: TCP
+      port: {{ .Values.php.port }}
+      targetPort: {{ .Values.php.port }}

@@ -1,0 +1,169 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glpi-bootstrap-scripts
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    set -e
+    cd /var/www/html
+
+    echo "== [1/5] Attente de la base de donnees =="
+    php -r '
+      $host = getenv("DB_HOST"); $port = (int) getenv("DB_PORT");
+      $deadline = time() + 90;
+      while (time() < $deadline) {
+        $conn = @fsockopen($host, $port, $errno, $errstr, 2);
+        if ($conn) { fclose($conn); exit(0); }
+        sleep(2);
+      }
+      fwrite(STDERR, "DB injoignable apres 90s\n");
+      exit(1);
+    '
+
+    echo "== [2/5] Attente du code GLPI sur le volume partage =="
+    # L'init container "seed-glpi-code" du Deployment php copie le code
+    # GLPI (bin/console inclus) sur le volume partage a son premier
+    # demarrage. Comme ce Job tourne independamment (hook PostSync), il
+    # doit attendre activement que ce provisionnement soit termine.
+    deadline=$(( $(date +%s) + 90 ))
+    until [ -f bin/console ]; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "ERREUR: bin/console introuvable apres 90s, le volume n'a" >&2
+        echo "peut-etre pas ete provisionne par le pod php. Abandon." >&2
+        exit 1
+      fi
+      sleep 2
+    done
+    echo "-> bin/console present, on continue"
+
+    echo "== [3/5] Installation de la base GLPI (idempotent) =="
+    # Sans --force, cette commande echoue proprement si une installation
+    # existe deja (elle ne supprime rien) : le "|| echo" ci-dessous permet
+    # au job de continuer dans ce cas, qui est le cas nominal apres le
+    # premier deploiement.
+    php bin/console database:install --no-interaction \
+      --db-host="$DB_HOST" --db-port="$DB_PORT" --db-name="$DB_NAME" \
+      --db-user="$DB_USER" --db-password="$DB_PASSWORD" \
+      --default-language=fr_FR \
+      || echo "-> deja installee (ou echec non bloquant), on continue"
+
+    echo "== [4/5] Installation et activation du plugin Single Sign-on =="
+    # Ces commandes renvoient un code de sortie non-zero quand le plugin
+    # est deja installe/actif (cas nominal apres le premier deploiement).
+    # On ne bloque donc pas dessus : c'est seed-sso.php, ci-dessous, qui
+    # verifie reellement si le plugin est fonctionnel (existence de sa
+    # table), plutot que de se fier a ces codes de sortie peu fiables.
+    php bin/console glpi:plugin:install singlesignon --no-interaction || true
+    php bin/console glpi:plugin:activate singlesignon --no-interaction || true
+
+    if [ -n "$SSO_CLIENT_ID" ]; then
+      echo "== [5/5] Configuration du provider Keycloak =="
+      php /scripts/seed-sso.php
+    else
+      echo "== [5/5] SSO_CLIENT_ID absent, configuration du provider ignoree =="
+    fi
+
+    echo "== Bootstrap termine =="
+
+  seed-sso.php: |
+    <?php
+    // Insere ou met a jour de facon idempotente le provider Keycloak dans
+    // la table du plugin glpi-singlesignon (v2.0.3). L'id est fige a 1 pour
+    // que l'URL de callback Keycloak soit connue a l'avance et stable :
+    //   https://<glpi>/plugins/singlesignon/front/callback.php/provider/1
+    //
+    // ATTENTION: ce script ecrit directement dans une table interne du
+    // plugin. Il n'est pas garanti stable a travers les futures versions
+    // du plugin (le schema pourrait changer). Verifiez apres chaque montee
+    // de version du plugin que les colonnes utilisees existent toujours
+    // (cf. hook.php du plugin, fonction plugin_singlesignon_install()).
+
+    $mysqli = new mysqli(
+        getenv('DB_HOST'),
+        getenv('DB_USER'),
+        getenv('DB_PASSWORD'),
+        getenv('DB_NAME'),
+        (int) getenv('DB_PORT')
+    );
+
+    if ($mysqli->connect_errno) {
+        fwrite(STDERR, "Connexion DB echouee: {$mysqli->connect_error}\n");
+        exit(1);
+    }
+
+    // Verification explicite que la table existe avant d'ecrire dedans,
+    // pour produire un message clair plutot qu'une exception mysqli brute
+    // si l'activation du plugin a echoue silencieusement.
+    $check = $mysqli->query("SHOW TABLES LIKE 'glpi_plugin_singlesignon_providers'");
+    if (!$check || $check->num_rows === 0) {
+        fwrite(STDERR, "La table glpi_plugin_singlesignon_providers n'existe pas.\n");
+        fwrite(STDERR, "Le plugin singlesignon n'est probablement pas active.\n");
+        exit(1);
+    }
+
+    $id               = 1;
+    $name             = getenv('SSO_NAME') ?: 'Keycloak';
+    $clientId         = getenv('SSO_CLIENT_ID');
+    $clientSecret     = getenv('SSO_CLIENT_SECRET');
+    $scope            = getenv('SSO_SCOPE') ?: 'openid email profile';
+    $authUrl          = getenv('SSO_AUTH_URL');
+    $tokenUrl         = getenv('SSO_TOKEN_URL');
+    $userinfoUrl      = getenv('SSO_USERINFO_URL');
+    $autoRegister     = (int) (getenv('SSO_AUTO_REGISTER') ?: 1);
+    $defaultProfileId = (int) (getenv('SSO_DEFAULT_PROFILE_ID') ?: 0);
+    $defaultEntityId  = (int) (getenv('SSO_DEFAULT_ENTITY_ID') ?: 0);
+
+    $stmt = $mysqli->prepare(
+        "INSERT INTO glpi_plugin_singlesignon_providers
+            (id, type, name, client_id, client_secret, scope, url_authorize,
+             url_access_token, url_resource_owner_details, is_active,
+             auto_register, default_profiles_id, default_entities_id,
+             ssl_verify_host, ssl_verify_peer, date_creation, date_mod)
+         VALUES
+            (?, 'Generic', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, 1, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE
+            name = VALUES(name),
+            client_id = VALUES(client_id),
+            client_secret = VALUES(client_secret),
+            scope = VALUES(scope),
+            url_authorize = VALUES(url_authorize),
+            url_access_token = VALUES(url_access_token),
+            url_resource_owner_details = VALUES(url_resource_owner_details),
+            is_active = 1,
+            auto_register = VALUES(auto_register),
+            default_profiles_id = VALUES(default_profiles_id),
+            default_entities_id = VALUES(default_entities_id),
+            date_mod = NOW()"
+    );
+
+    if (!$stmt) {
+        fwrite(STDERR, "Preparation SQL echouee: {$mysqli->error}\n");
+        exit(1);
+    }
+
+    $stmt->bind_param(
+        'isssssssiii',
+        $id,
+        $name,
+        $clientId,
+        $clientSecret,
+        $scope,
+        $authUrl,
+        $tokenUrl,
+        $userinfoUrl,
+        $autoRegister,
+        $defaultProfileId,
+        $defaultEntityId
+    );
+
+    if (!$stmt->execute()) {
+        fwrite(STDERR, "Execution SQL echouee: {$stmt->error}\n");
+        exit(1);
+    }
+
+    echo "Provider '{$name}' (id={$id}) cree/mis a jour.\n";
+    echo "Callback URL a declarer dans Keycloak:\n";
+    echo "  <URL_GLPI>/plugins/singlesignon/front/callback.php/provider/{$id}\n";

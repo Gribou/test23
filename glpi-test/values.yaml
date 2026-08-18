@@ -1,0 +1,278 @@
+# =========================
+# NGINX
+# =========================
+
+replicaCount: 1
+
+
+nginx:
+  image:
+    name: registry.asap.dsna.fr/dsna/cloud/guic-dev-helm/nginx-unprivileged:latest
+    pullPolicy: IfNotPresent
+    imagePullSecrets: 4pullguic
+
+  port: 8080
+
+  resources: {}
+
+  config: |
+    server {
+        listen 8080;
+        server_name localhost;
+
+        root /var/www/html/public;
+        index index.php;
+
+
+        # =========================
+        # GLPI principal
+        # =========================
+
+        location / {
+
+            try_files $uri $uri/ /index.php$is_args$args;
+        }
+
+
+        # =========================
+        # Front controller GLPI 11
+        # =========================
+
+        location ~ ^/index\.php(/|$) {
+
+            include fastcgi_params;
+
+            fastcgi_pass php.guic-dev.svc.cluster.local:9000;
+
+            fastcgi_split_path_info ^(.+\.php)(/.+)$;
+
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param DOCUMENT_ROOT $document_root;
+            fastcgi_param PATH_INFO $fastcgi_path_info;
+            fastcgi_param QUERY_STRING $query_string;
+        }
+
+
+        # =========================
+        # API REST GLPI
+        # =========================
+
+        location ~ ^/apirest\.php(/|$) {
+
+            include fastcgi_params;
+
+            fastcgi_pass php.guic-dev.svc.cluster.local:9000;
+
+            fastcgi_split_path_info ^(.+\.php)(/.+)$;
+
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param DOCUMENT_ROOT $document_root;
+            fastcgi_param PATH_INFO $fastcgi_path_info;
+            fastcgi_param QUERY_STRING $query_string;
+        }
+
+
+        # =========================
+        # Plugins GLPI
+        # =========================
+        # NOTE: pas de location dediee ici. Les fichiers des
+        # plugins (front/*.php, public/*.php, etc.) vivent en
+        # dehors de public/ (comme install/ et front/ du coeur
+        # GLPI), donc les cibler directement via SCRIPT_FILENAME
+        # = $document_root$fastcgi_script_name echoue (fichier
+        # introuvable). On laisse la location / (try_files) les
+        # faire retomber naturellement sur index.php, qui route
+        # tout en interne, y compris /plugins/*.
+        # =========================
+
+
+        # =========================
+        # Ressources statiques
+        # =========================
+
+        location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+
+            expires 7d;
+
+            access_log off;
+        }
+
+
+        # =========================
+        # NOTE: pas de blocage generique des .php ici.
+        # GLPI 11 route TOUT via public/index.php : toute URL
+        # .php qui ne correspond a aucun fichier reel dans
+        # public/ (front/login.php, install/install.php,
+        # plugins/*/front/*.php, etc.) retombe naturellement
+        # sur index.php via le try_files de la location / ci-
+        # dessus. C'est le comportement officiellement
+        # recommande par GLPI (cf. doc install).
+        # =========================
+
+
+        # =========================
+        # Protection fichiers cachés
+        # =========================
+
+        location ~ /\. {
+
+            deny all;
+        }
+
+
+        # =========================
+        # Protection fichiers internes GLPI
+        # =========================
+
+        location ~ ^/(config|files|vendor|src|templates|bin)/ {
+
+            deny all;
+        }
+    }
+
+
+
+# =========================
+# PHP-FPM
+# =========================
+# ATTENTION: verifiez que cette image contient bien deja le plugin
+# singlesignon (via votre propre build a partir de Dockerfile.php).
+# Si ce n'est pas encore le cas, le Job de bootstrap echouera a
+# l'etape "glpi:plugin:install singlesignon" faute de trouver le
+# plugin sur le volume partage.
+
+php:
+  image: registry.asap.dsna.fr/dsna/cloud/test-glpi/main
+
+  imagePullSecrets: 4pullguic2
+
+  port: 9000
+
+  resources: {}
+
+
+
+# =========================
+# STOCKAGE GLPI
+# =========================
+
+pvc:
+  name: shared-storage
+
+  storageClassName: nfs-csi
+
+  accessModes:
+    - ReadWriteOnce
+
+  size: 1Gi
+
+
+
+# =========================
+# DATABASE MARIADB
+# =========================
+
+database:
+  type: mariadb
+
+  image: mariadb
+
+  tag: "10.6"
+
+  pullPolicy: IfNotPresent
+
+  rootPassword: root_password
+
+  glpiUser: glpi_user
+
+  glpiPassword: glpi_password
+
+  glpiDatabase: glpi_db
+
+
+
+# =========================
+# PERSISTANCE DATABASE
+# =========================
+
+persistence:
+  database:
+    enabled: true
+
+    size: 5Gi
+
+    accessMode: ReadWriteOnce
+
+
+
+# =========================
+# SERVICES
+# =========================
+
+service:
+  nginxPort: 8080
+
+  phpPort: 9000
+
+  databasePort: 3306
+
+
+
+# =========================
+# OPENSHIFT ROUTE
+# =========================
+
+route:
+  enabled: true
+
+  host: ticketing-guic-dev.apps.ext-preops.dsna.cloud
+
+
+
+# =========================
+# SINGLE SIGN-ON (Keycloak)
+# =========================
+
+sso:
+  enabled: true
+  name: "Keycloak"
+  realm: "angelique-users"
+  keycloakBaseUrl: "https://keycloak.ext-preops.dsna.cloud"
+  clientId: "glpi"
+  scope: "openid email profile"
+  autoRegister: true
+
+  # ID numerique du profil GLPI assigne par defaut aux nouveaux comptes crees
+  # via SSO. Confirme le 04/08 : id=1 correspond a "Self-Service" sur cette
+  # instance (profil a droits restreints, adapte a l'auto-inscription).
+  defaultProfileId: 1
+
+  # 0 = Entite racine, sinon voir SELECT id, name FROM glpi_entities;
+  defaultEntityId: 0
+
+  # Nom du Secret Kubernetes (scelle) contenant la cle "clientSecret"
+  secretName: "glpi-sso-secret"
+
+
+
+# =========================
+# SEALED SECRET (pattern officiel plateforme)
+# =========================
+# Generez la valeur avec (cf. doc plateforme, section 3.2/3.3):
+#   echo -n "<votre-client-secret-keycloak>" | kubeseal --raw \
+#     --controller-name=sealed-secrets-controller \
+#     --controller-namespace=sealed-secrets \
+#     --namespace guic-dev --scope namespace-wide
+# Collez le resultat (une longue chaine base64) ci-dessous.
+
+sealedSecret:
+  encryptedData:
+    clientSecret: "AgA4J5+wcRimbgDGqbCPQ6cGJFtNJ4vfmT1a5QNxxUj/mEwnREzEgpATGarlDhtyC3lHPWNV2o4Z1WWFDQWsUjYfPvMuPWzGYGr4RTHPnTVW8bsUY2mILYWRmtJN1e+ivlYiO2RX5e9s0MDI6uQVLILZLReTMwsXnaWDWJsvqD7rSFG0wt+MQMY8FCbNlTXbQR/TeEuaAcnIbk5UeM8zLKh4oGelZHWn+aj49F/JIf7ynHuX8zrm8WEuiZC77RWZcBDbWuRq6/2hFWJU1X9KvZjF/3bCpohE4Z5zlUHApmmnLmfO4UCAHdHvAIFU6xTW5ksdjCqhie6EP9yQR7MbMZUvJ7MdxhV6PXc4d/q044C3ybbKTTHvsCC2/KawuhCX7oCM7drGAfX7t6YLrn76qa57GvfwECFEwDVoDnzTzSXIhpqhwyU/mRRAkjFMSp1115h436xfEHMG9bQ4sTPablgYm+ElHnKAsnCcwYMW80NuO65bGLzTPnJM3EYTKjtCuT3FrJuyJRbGQDfj/l0aevXkiGTAaWV6mZdWu1pKVWNWpQn9VKwgrATjs4LNFIuSLqthzNFqq5t5H1JPLeg33FgrkvnKcjNYCzF4X3xKhi1zLQO/rapmAmZIVczKh1GdGOkdXLaOl8FSnQ555IbY6utu+BKPmzUJZJDdlvzpXuXAv/itM9cXF29y2A0MzyBL3xQ7/HrHd/zKhV1wjXisrwjaQuu4hBYiXD+fEzqR03x+BN7Il/Dicow/"
+
+
+
+# =========================
+# RESSOURCES
+# =========================
+
+resources: {}

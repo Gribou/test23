@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-database
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-database
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-database
+    spec:
+      containers:
+      - name: database
+        image: "{{ .Values.database.image }}:{{ .Values.database.tag }}"
+        imagePullPolicy: {{ .Values.database.pullPolicy }}
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: {{ .Values.database.rootPassword }}
+        - name: MYSQL_DATABASE
+          value: {{ .Values.database.glpiDatabase }}
+        - name: MYSQL_USER
+          value: {{ .Values.database.glpiUser }}
+        - name: MYSQL_PASSWORD
+          value: {{ .Values.database.glpiPassword }}
+        ports:
+        - containerPort: {{ .Values.service.databasePort }}
+        volumeMounts:
+        - name: database-data
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: database-data
+        persistentVolumeClaim:
+          claimName: {{ .Release.Name }}-database-pvc

@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: php
+  template:
+    metadata:
+      labels:
+        app: php
+    spec:
+      imagePullSecrets:
+        - name: {{ .Values.php.imagePullSecrets }}
+      initContainers:
+        # L'image php.image contient le code GLPI directement dans son
+        # systeme de fichiers a /var/www/html, mais monter le PVC partage
+        # (vide au premier deploiement) sur ce meme chemin masque ce
+        # contenu pour le conteneur principal. Cet init container monte
+        # le volume a un chemin DIFFERENT (/mnt/target), ce qui lui
+        # laisse voir le vrai contenu de l'image a /var/www/html, et le
+        # copie vers le volume partage. Idempotent : ne fait rien si
+        # bin/console est deja present (deploiements suivants).
+        - name: seed-glpi-code
+          image: {{ .Values.php.image }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -f /mnt/target/bin/console ]; then
+                echo "Code GLPI deja present sur le volume, rien a faire."
+              else
+                echo "Volume vide, copie du code GLPI depuis l'image..."
+                cp -a /var/www/html/. /mnt/target/
+                echo "Copie terminee."
+              fi
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /mnt/target
+      containers:
+        - name: php-fpm
+          image: {{ .Values.php.image }}
+          # L'image ecoute par defaut sur 127.0.0.1:9000 (pensee pour un
+          # deploiement nginx+php dans le MEME pod, via localhost partage).
+          # Dans notre architecture (pods separes), nginx ne peut jamais
+          # joindre php-fpm avec ce reglage : la connexion echoue
+          # silencieusement et nginx attend jusqu'au timeout (504 Gateway
+          # Timeout). On corrige le fichier de conf juste avant de lancer
+          # php-fpm pour qu'il ecoute sur toutes les interfaces.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # /usr/local/etc/php-fpm.d/www.conf appartient a root:root et
+              # n'est pas modifiable par l'UID non-root impose par
+              # OpenShift. On copie toute la config PHP-FPM vers un dossier
+              # temporaire inscriptible, on corrige le "listen" (l'image
+              # n'ecoute par defaut que sur 127.0.0.1, ce qui empeche nginx,
+              # dans un pod separe, de joindre php-fpm), puis on demarre
+              # php-fpm en pointant explicitement sur cette copie.
+              mkdir -p /tmp/php-fpm.d
+              cp -a /usr/local/etc/php-fpm.d/. /tmp/php-fpm.d/
+              sed -i 's/^listen = 127\.0\.0\.1:9000/listen = 0.0.0.0:9000/' /tmp/php-fpm.d/www.conf
+              cp /usr/local/etc/php-fpm.conf /tmp/php-fpm.conf
+              sed -i 's#/usr/local/etc/php-fpm\.d/\*\.conf#/tmp/php-fpm.d/*.conf#' /tmp/php-fpm.conf
+              exec php-fpm --fpm-config /tmp/php-fpm.conf --nodaemonize
+          ports:
+            - containerPort: {{ .Values.php.port }}
+          env:
+            # L'image definit par defaut CACHE_DSN=redis://redis:6379/, un
+            # hote qui n'existe pas dans ce namespace : GLPI reste bloque a
+            # essayer de s'y connecter a chaque requete (jusqu'a un
+            # 504 Gateway Timeout cote routeur). On vide la valeur pour
+            # forcer GLPI a utiliser son cache fichier (deja sur le volume
+            # partage, /var/lib/glpi/_cache).
+            - name: CACHE_DSN
+              value: ""
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /var/www/html
+            # GLPI_CONFIG_DIR et GLPI_VAR_DIR (definis par l'image) pointent
+            # en dehors de /var/www/html. Sans ces montages, chaque pod
+            # (et chaque Job) a sa propre copie ephemere de ces dossiers :
+            # la config generee par le Job d'installation disparait avec
+            # lui et n'est jamais vue par le pod php-fpm qui sert les
+            # requetes web. On reutilise le meme PVC via subPath pour que
+            # tous les pods/Jobs partagent exactement les memes fichiers.
+            - name: shared-storage
+              mountPath: /etc/glpi/config
+              subPath: etc-glpi-config
+            - name: shared-storage
+              mountPath: /var/lib/glpi
+              subPath: var-lib-glpi
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.pvc.name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php
+spec:
+  selector:
+    app: php
+  ports:
+    - protocol: TCP
+      port: {{ .Values.php.port }}
+      targetPort: {{ .Values.php.port }

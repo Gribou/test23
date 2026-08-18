@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Nom fixe (pas de suffixe de revision) : les hooks ArgoCD natifs
+  # suppriment eux-memes le Job apres succes (hook-delete-policy),
+  # donc pas de risque de collision de nom entre deux sync.
+  name: glpi-bootstrap
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    # Hooks ArgoCD natifs (et non "helm.sh/hook") : ArgoCD genere les
+    # manifests via "helm template" (pas un vrai "helm install"/"upgrade"),
+    # donc le systeme de hooks Helm n'est pas correctement interprete et
+    # provoque des erreurs de comparaison ("groupVersion shouldn't be
+    # empty"). argocd.argoproj.io/hook est le mecanisme natif et supporte,
+    # execute apres que toutes les autres ressources soient synchronisees
+    # et en bonne sante.
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: glpi-bootstrap
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: {{ .Values.php.imagePullSecrets }}
+      containers:
+        - name: bootstrap
+          image: {{ .Values.php.image }}
+          command: ["/bin/sh", "/scripts/bootstrap.sh"]
+          env:
+            - name: DB_HOST
+              value: "{{ .Release.Name }}-database"
+            - name: DB_PORT
+              value: "3306"
+            - name: DB_NAME
+              value: {{ .Values.database.glpiDatabase | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.glpiUser | quote }}
+            - name: DB_PASSWORD
+              value: {{ .Values.database.glpiPassword | quote }}
+            - name: CACHE_DSN
+              value: ""
+            {{- if .Values.sso.enabled }}
+            - name: SSO_NAME
+              value: {{ .Values.sso.name | quote }}
+            - name: SSO_CLIENT_ID
+              value: {{ .Values.sso.clientId | quote }}
+            - name: SSO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sso.secretName }}
+                  key: clientSecret
+            - name: SSO_SCOPE
+              value: {{ .Values.sso.scope | quote }}
+            - name: SSO_AUTH_URL
+              value: "{{ .Values.sso.keycloakBaseUrl }}/realms/{{ .Values.sso.realm }}/protocol/openid-connect/auth"
+            - name: SSO_TOKEN_URL
+              value: "{{ .Values.sso.keycloakBaseUrl }}/realms/{{ .Values.sso.realm }}/protocol/openid-connect/token"
+            - name: SSO_USERINFO_URL
+              value: "{{ .Values.sso.keycloakBaseUrl }}/realms/{{ .Values.sso.realm }}/protocol/openid-connect/userinfo"
+            - name: SSO_AUTO_REGISTER
+              value: {{ if .Values.sso.autoRegister }}"1"{{ else }}"0"{{ end }}
+            - name: SSO_DEFAULT_PROFILE_ID
+              value: "{{ .Values.sso.defaultProfileId }}"
+            - name: SSO_DEFAULT_ENTITY_ID
+              value: "{{ .Values.sso.defaultEntityId }}"
+            {{- end }}
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /var/www/html
+            - name: shared-storage
+              mountPath: /etc/glpi/config
+              subPath: etc-glpi-config
+            - name: shared-storage
+              mountPath: /var/lib/glpi
+              subPath: var-lib-glpi
+            - name: bootstrap-scripts
+              mountPath: /scripts
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.pvc.name }}
+        - name: bootstrap-scripts
+          configMap:
+            name: glpi-bootstrap-scripts
+            defaultMode: 0755
